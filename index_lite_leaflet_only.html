@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>全球电厂能源结构与装机规模（轻量版）</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    #map { height: 100%; width: 100%; }
+    .panel { position: absolute; top: 12px; left: 12px; z-index: 1000; width: min(380px, calc(100vw - 24px));
+      background: rgba(255,255,255,0.95); border-radius: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.12);
+      padding: 12px 12px 10px 12px; backdrop-filter: blur(6px); }
+    .panel h1 { font-size: 16px; margin: 0 0 6px 0; }
+    .panel .sub { font-size: 12px; color: #444; line-height: 1.35; }
+    .row { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
+    .row label { font-size: 12px; color: #222; min-width: 88px; }
+    .row input[type="range"] { width: 100%; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 8px; border-radius: 999px;
+      border: 1px solid rgba(0,0,0,0.12); background: rgba(255,255,255,0.9); font-size: 12px; cursor: pointer; user-select: none; }
+    .chip input { margin: 0; }
+    .sw { width: 10px; height: 10px; border-radius: 50%; border: 1px solid rgba(0,0,0,0.25); display:inline-block; }
+    .status { margin-top: 10px; font-size: 12px; color:#111; line-height: 1.35; }
+    .btn { margin-top: 10px; display: inline-flex; align-items: center; justify-content: center; padding: 8px 10px;
+      border-radius: 10px; border: 1px solid rgba(0,0,0,0.12); background: rgba(255,255,255,0.95); cursor: pointer; font-size: 12px; }
+    .btn:hover { background: #fff; }
+    .footer { margin-top: 10px; font-size: 11px; color: #555; line-height: 1.35; }
+    @media (max-width: 520px) { .panel { top:auto; bottom:12px; left:12px; } }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+  <h1>全球电厂能源结构与装机规模（轻量版）</h1>
+  <div class="sub">
+    仅使用 Leaflet（去掉聚合/CSV解析库），避免 CDN 被拦导致“准备加载数据…”卡住。<br/>
+    颜色=燃料类型，点大小=装机容量（MW）。为保证流畅，默认最多渲染 <b>8000</b> 个点（按容量从大到小优先）。
+  </div>
+
+  <div class="row">
+    <label>最小容量</label>
+    <input id="capRange" type="range" min="0" max="2000" step="50" value="0"/>
+  </div>
+  <div class="row" style="margin-top:6px;">
+    <div style="font-size:12px;color:#222;">≥ <span id="capVal">0</span> MW</div>
+    <div style="flex:1"></div>
+    <div style="font-size:12px;color:#444;"><span id="shownCount">0</span> / <span id="totalCount">0</span></div>
+  </div>
+
+  <div class="chips" id="fuelChips"></div>
+  <div class="status" id="statusText">准备加载数据…</div>
+  <div class="btn" id="resetBtn">重置视图</div>
+
+  <div class="footer">
+    © OpenStreetMap contributors（底图） · 数据许可：CC BY 4.0（WRI GPPD）。<br/>
+    数据源（默认）：jsDelivr 镜像 GPPD CSV（如需更稳，可把 CSV 放到同仓库并改成 ./global_power_plant_database.csv）。
+  </div>
+</div>
+
+<script>
+  const map = L.map('map').setView([20, 0], 2);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+  const layer = L.layerGroup().addTo(map);
+
+  const CSV_URL = 'https://cdn.jsdelivr.net/gh/wri/global-power-plant-database@master/output_database/global_power_plant_database.csv';
+  // const CSV_URL = './global_power_plant_database.csv'; // put CSV in same repo for max stability
+
+  const fuelColors = { Coal:"#4b5563", Gas:"#2563eb", Oil:"#a16207", Hydro:"#0ea5e9", Wind:"#22c55e", Solar:"#f59e0b",
+    Nuclear:"#7c3aed", Biomass:"#16a34a", Geothermal:"#ef4444", Waste:"#f97316", Other:"#64748b" };
+  const fuelOrder = Object.keys(fuelColors);
+  const state = { minCap: 0, fuels: new Set(fuelOrder), records: [] };
+
+  const statusEl = document.getElementById('statusText');
+  const capRange = document.getElementById('capRange');
+  const capVal = document.getElementById('capVal');
+  const fuelChips = document.getElementById('fuelChips');
+
+  function setStatus(t){ statusEl.textContent = t; }
+  function updateCounts(shown,total){
+    document.getElementById('shownCount').textContent = shown.toLocaleString();
+    document.getElementById('totalCount').textContent = total.toLocaleString();
+  }
+  function colorForFuel(f){ return fuelColors[f] || fuelColors.Other; }
+  function radiusFromCapacity(cap){
+    if (!isFinite(cap) || cap <= 0) return 4;
+    if (cap < 100) return 4;
+    if (cap < 500) return 6;
+    if (cap < 2000) return 9;
+    return 12;
+  }
+  function escapeHtml(s){ return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+  function buildFuelUI(){
+    fuelChips.innerHTML = '';
+    fuelOrder.forEach(f => {
+      const chip = document.createElement('label');
+      chip.className = 'chip';
+      const cb = document.createElement('input');
+      cb.type='checkbox'; cb.checked=true; cb.dataset.fuel=f;
+      cb.addEventListener('change', e => { const fuel = e.target.dataset.fuel; e.target.checked ? state.fuels.add(fuel) : state.fuels.delete(fuel); render(); });
+      const sw = document.createElement('span'); sw.className='sw'; sw.style.background = colorForFuel(f);
+      const txt = document.createElement('span'); txt.textContent = f;
+      chip.appendChild(cb); chip.appendChild(sw); chip.appendChild(txt);
+      fuelChips.appendChild(chip);
+    });
+  }
+  buildFuelUI();
+
+  capRange.addEventListener('input', ()=>{ state.minCap = Number(capRange.value||0); capVal.textContent = state.minCap; render(); });
+  document.getElementById('resetBtn').addEventListener('click', ()=> map.setView([20,0],2));
+
+  function parseCSVLine(line){
+    const out = []; let cur = ''; let inQuotes = false;
+    for (let i=0;i<line.length;i++){
+      const ch = line[i];
+      if (ch === '"'){
+        if (inQuotes && line[i+1] === '"'){ cur += '"'; i++; }
+        else { inQuotes = !inQuotes; }
+      } else if (ch === ',' && !inQuotes) { out.push(cur); cur=''; }
+      else { cur += ch; }
+    }
+    out.push(cur); return out;
+  }
+
+  async function load(){
+    try{
+      setStatus('正在下载 CSV…');
+      const resp = await fetch(CSV_URL, {cache:'no-store'});
+      if(!resp.ok) throw new Error('HTTP ' + resp.status);
+      const text = await resp.text();
+
+      setStatus('正在解析 CSV…');
+      const lines = text.split(/\r?\n/).filter(x => x.trim().length>0);
+      const header = parseCSVLine(lines[0]);
+      const idx = {}; header.forEach((k,i)=> idx[k]=i);
+
+      const iLat = idx['latitude'], iLon = idx['longitude'], iFuel = idx['primary_fuel'],
+            iCap = idx['capacity_mw'], iName = idx['name'], iCtry = idx['country_long'],
+            iOwner = idx['owner'], iYear = idx['commissioning_year'], iUrl = idx['url'];
+
+      const recs = [];
+      for(let i=1;i<lines.length;i++){
+        const row = parseCSVLine(lines[i]);
+        const lat = Number(row[iLat]); const lon = Number(row[iLon]);
+        if(!isFinite(lat) || !isFinite(lon)) continue;
+        const cap = Number(row[iCap]);
+        const fuel = (row[iFuel] || 'Other').trim() || 'Other';
+        recs.push({ lat, lon, cap: isFinite(cap)?cap:NaN, fuel,
+          name: row[iName]||'', country: row[iCtry]||'', owner: row[iOwner]||'', year: row[iYear]||'', url: row[iUrl]||'' });
+      }
+      recs.sort((a,b)=>((isFinite(b.cap)?b.cap:-1)-(isFinite(a.cap)?a.cap:-1)));
+      state.records = recs;
+
+      setStatus(`解析完成：${recs.length.toLocaleString()} 条有效点。正在渲染…`);
+      render();
+    }catch(e){
+      console.error(e);
+      setStatus('加载失败：可能网络拦截了数据源。建议把 CSV 下载后放到同仓库，并把 CSV_URL 改成 ./global_power_plant_database.csv');
+    }
+  }
+
+  function render(){
+    const maxRender = 8000;
+    layer.clearLayers();
+
+    const minCap = state.minCap;
+    const fuels = state.fuels;
+    let shown = 0;
+
+    for (let i=0;i<state.records.length && shown<maxRender;i++){
+      const r = state.records[i];
+      if (!fuels.has(r.fuel)) continue;
+      const okCap = !isFinite(r.cap) ? (minCap===0) : (r.cap >= minCap);
+      if (!okCap) continue;
+
+      const color = colorForFuel(r.fuel);
+      const marker = L.circleMarker([r.lat, r.lon], { radius: radiusFromCapacity(r.cap), color, weight:1, fillColor:color, fillOpacity:0.75 });
+
+      const popup = `<div style="min-width:240px">
+        <div style="font-weight:700;font-size:14px;line-height:1.25;">${escapeHtml(r.name || '(unknown)')}</div>
+        <div style="margin-top:6px;font-size:12px;color:#333;line-height:1.35;">
+          <b>国家：</b>${escapeHtml(r.country)}<br/>
+          <b>燃料：</b>${escapeHtml(r.fuel)}<br/>
+          <b>容量：</b>${isFinite(r.cap) ? r.cap.toFixed(1) : 'NA'} MW<br/>
+          ${r.owner ? `<b>业主：</b>${escapeHtml(r.owner)}<br/>` : ``}
+          ${r.year ? `<b>投运年：</b>${escapeHtml(String(r.year))}<br/>` : ``}
+          ${r.url ? `<b>来源：</b><a href="${r.url}" target="_blank" rel="noopener">link</a>` : ``}
+        </div></div>`;
+      marker.bindPopup(popup).addTo(layer);
+      shown++;
+    }
+
+    updateCounts(shown, state.records.length);
+    setStatus(`已显示：${shown.toLocaleString()} 个点（为保证流畅最多渲染 8000 个；提高最小容量可聚焦大电厂）`);
+  }
+
+  load();
+</script>
+</body>
+</html>
